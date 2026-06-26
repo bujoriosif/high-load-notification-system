@@ -1,0 +1,32 @@
+{
+  "name": "twitter-notification-poc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hybrid fan-out + idempotent dedup + merged feed — X-scale notification POC",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "start:dev": "ts-node src/main.ts",
+    "seed": "ts-node src/seed/seed.ts",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.1.27",
+    "@nestjs/core": "^11.1.27",
+    "@nestjs/platform-express": "^11.1.27",
+    "better-sqlite3": "^12.11.1",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.15.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^22.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4"
+  }
+}

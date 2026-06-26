@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Notification Fan-out Simulator</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 860px;
+         margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.2rem; }
+  .sub { opacity: 0.7; margin-top: 0; }
+  .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem 1.25rem;
+              align-items: end; margin: 1.25rem 0; padding: 1rem; border: 1px solid #8884;
+              border-radius: 10px; }
+  .controls .full { grid-column: 1 / -1; }
+  label { font-size: 0.85rem; opacity: 0.85; display: block; margin-bottom: 0.25rem; }
+  input[type=range] { width: 100%; }
+  input[type=number], select { width: 100%; padding: 0.4rem; border-radius: 6px;
+                               border: 1px solid #8886; background: transparent; color: inherit; }
+  button { padding: 0.6rem 1.2rem; font-size: 1rem; border: 0; border-radius: 8px;
+           background: #2d6cdf; color: #fff; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .total-val { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 1.1rem; }
+  .card { border: 1px solid #8884; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+  .card h2 { font-size: 1rem; margin: 0 0 0.5rem; display: flex; justify-content: space-between; }
+  .bar { height: 16px; background: #8883; border-radius: 8px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: #2d6cdf; transition: width 0.12s linear; }
+  .bar.rt > div { background: #18a558; }
+  .stats { display: flex; gap: 1.5rem; flex-wrap: wrap; font-variant-numeric: tabular-nums;
+           font-size: 0.9rem; margin-top: 0.5rem; }
+  .stats b { font-weight: 600; }
+  .note { margin-top: 0.6rem; font-size: 0.85rem; opacity: 0.85; border-left: 3px solid #2d6cdf;
+          padding-left: 0.6rem; }
+  .card.rt .note { border-left-color: #18a558; }
+  .muted { opacity: 0.55; }
+</style>
+</head>
+<body>
+  <h1>Notification Fan-out Simulator</h1>
+  <p class="sub">Post once, watch it go out. Compare <b>fan-out-on-write</b> (real, capped rows) vs
+     <b>real-time delivery</b> (smeared over a window) at 1k–1M scale.</p>
+
+  <div class="controls">
+    <div class="full">
+      <label for="total">Scale: <span id="totalVal" class="total-val">100,000</span> notifications</label>
+      <input type="range" id="total" min="0" max="100" value="67" />
+    </div>
+    <div>
+      <label for="strategy">Strategy</label>
+      <select id="strategy">
+        <option value="both" selected>both (side-by-side)</option>
+        <option value="write">write (fan-out-on-write)</option>
+        <option value="realtime">realtime (smeared push)</option>
+      </select>
+    </div>
+    <div>
+      <label for="windowMs">Smear window (ms)</label>
+      <input type="number" id="windowMs" value="10000" min="100" max="120000" step="500" />
+    </div>
+    <div>
+      <label for="ratePerSec">Gateway cap (pushes/sec)</label>
+      <input type="number" id="ratePerSec" value="50000" min="1" step="1000" />
+    </div>
+    <div>
+      <label for="writeCap">Write cap (real rows)</label>
+      <input type="number" id="writeCap" value="100000" min="0" max="1000000" step="10000" />
+    </div>
+    <div class="full">
+      <button id="go">Post &amp; watch</button>
+      <span id="status" class="muted"></span>
+    </div>
+  </div>
+
+  <div id="writeCard" class="card" hidden>
+    <h2><span>📝 Fan-out-on-write</span><span id="writePct" class="muted">0%</span></h2>
+    <div class="bar"><div id="writeBar"></div></div>
+    <div class="stats">
+      <span><b id="writeSent">0</b> / <span id="writeTarget">0</span> rows</span>
+      <span><b id="writeTput">0</b>/s</span>
+      <span>elapsed <b id="writeElapsed">0</b>ms</span>
+      <span>eta <b id="writeEta">–</b></span>
+      <span>durable rows <b id="writeDurable">0</b></span>
+    </div>
+    <div id="writeNote" class="note" hidden></div>
+  </div>
+
+  <div id="rtCard" class="card rt" hidden>
+    <h2><span>⚡ Real-time delivery (smeared)</span><span id="rtPct" class="muted">0%</span></h2>
+    <div class="bar rt"><div id="rtBar"></div></div>
+    <div class="stats">
+      <span><b id="rtSent">0</b> / <span id="rtTarget">0</span> pushes</span>
+      <span><b id="rtTput">0</b>/s</span>
+      <span>elapsed <b id="rtElapsed">0</b>ms</span>
+      <span>eta <b id="rtEta">–</b></span>
+      <span>durable rows <b id="rtDurable">0</b></span>
+    </div>
+    <div id="rtNote" class="note" hidden></div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const fmt = (n) => Number(n).toLocaleString();
+  const ms = (n) => (n == null ? '–' : n >= 1000 ? (n / 1000).toFixed(1) + 's' : Math.round(n) + 'ms');
+
+  // Log-scale slider: 0..100 -> 1,000..1,000,000
+  function sliderToTotal(v) {
+    const exp = 3 + (v / 100) * 3;
+    const raw = Math.pow(10, exp);
+    // round to 2 significant figures for tidy numbers
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)) - 1);
+    return Math.max(1000, Math.round(raw / mag) * mag);
+  }
+  const totalSlider = $('total');
+  const updateTotal = () => ($('totalVal').textContent = fmt(sliderToTotal(+totalSlider.value)));
+  totalSlider.addEventListener('input', updateTotal);
+  updateTotal();
+
+  let es = null;
+
+  function renderStrategy(prefix, p) {
+    if (!p) return;
+    const card = $(prefix + 'Card');
+    card.hidden = false;
+    $(prefix + 'Bar').style.width = (p.pct * 100).toFixed(1) + '%';
+    $(prefix + 'Pct').textContent = Math.round(p.pct * 100) + '%';
+    $(prefix + 'Sent').textContent = fmt(p.sent);
+    $(prefix + 'Target').textContent = fmt(p.target);
+    $(prefix + 'Tput').textContent = fmt(p.throughputPerSec);
+    $(prefix + 'Elapsed').textContent = fmt(p.elapsedMs);
+    $(prefix + 'Eta').textContent = ms(p.etaMs);
+    $(prefix + 'Durable').textContent = fmt(p.durableRows);
+    if (p.note) { const n = $(prefix + 'Note'); n.hidden = false; n.textContent = p.note; }
+  }
+
+  function reset() {
+    for (const pfx of ['write', 'rt']) {
+      $(pfx + 'Card').hidden = true;
+      $(pfx + 'Note').hidden = true;
+      $(pfx + 'Bar').style.width = '0';
+    }
+  }
+
+  $('go').addEventListener('click', async () => {
+    if (es) es.close();
+    reset();
+    const body = {
+      total: sliderToTotal(+totalSlider.value),
+      strategy: $('strategy').value,
+      windowMs: +$('windowMs').value,
+      ratePerSec: +$('ratePerSec').value,
+      writeCap: +$('writeCap').value,
+    };
+    $('go').disabled = true;
+    $('status').textContent = 'starting…';
+    try {
+      const res = await fetch('/sim/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error('start failed (' + res.status + ')');
+      const { runId } = await res.json();
+      $('status').textContent = 'running… (run ' + runId.slice(-6) + ')';
+
+      es = new EventSource('/sim/watch/' + runId);
+      es.onmessage = (e) => {
+        const snap = JSON.parse(e.data);
+        renderStrategy('write', snap.write);
+        renderStrategy('rt', snap.realtime);
+        if (snap.type === 'done' || snap.type === 'error') {
+          es.close();
+          $('go').disabled = false;
+          $('status').textContent = snap.type === 'done' ? 'done ✅' : 'error: ' + (snap.message || '');
+        }
+      };
+      es.onerror = () => { es.close(); $('go').disabled = false; $('status').textContent = 'stream closed'; };
+    } catch (err) {
+      $('go').disabled = false;
+      $('status').textContent = String(err);
+    }
+  });
+</script>
+</body>
+</html>
